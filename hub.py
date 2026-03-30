@@ -134,13 +134,29 @@ def init_db():
         );
 
         -- 向量表
-
-        -- 向量表
         CREATE TABLE IF NOT EXISTS embeddings (
-            scope TEXT NOT NULL CHECK(scope IN ('short', 'long')),
+            scope TEXT NOT NULL CHECK(scope IN ('short', 'long', 'memory')),
             mem_id INTEGER NOT NULL,
             vector BLOB NOT NULL,
             PRIMARY KEY (scope, mem_id)
+        );
+
+        -- Memory Sources: agent memory 文件的原始条目
+        CREATE TABLE IF NOT EXISTS memory_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT NOT NULL,
+            source_file TEXT NOT NULL,
+            block_title TEXT NOT NULL,
+            block_content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            section_date TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now', 'localtime'))
+        );
+
+        -- Memory Sources FTS5 索引
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_sources_fts USING fts5(
+            agent_name, block_title, block_content, segmented,
+            tokenize='unicode61'
         );
 
         -- 整合日志：记录哪些短期记忆已整合到长期
@@ -149,7 +165,61 @@ def init_db():
             long_id INTEGER REFERENCES long_term(id),
             consolidated_at TEXT DEFAULT (datetime('now', 'localtime'))
         );
+
+        -- Agent 活动流：记录各 agent 的活动
+        CREATE TABLE IF NOT EXISTS agent_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT NOT NULL,
+            activity_type TEXT NOT NULL CHECK(activity_type IN ('task_completed', 'decision_made', 'info_reported', 'error_occurred', 'heartbeat_report')),
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            session_id TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now', 'localtime'))
+        );
+
+        -- 跨 agent 共享笔记
+        CREATE TABLE IF NOT EXISTS memos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT NOT NULL,
+            memo_type TEXT NOT NULL CHECK(memo_type IN ('fact', 'insight', 'question', 'answer', 'cross_reference')),
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT DEFAULT '',
+            importance REAL DEFAULT 0.5,
+            created_at TEXT DEFAULT (datetime('now', 'localtime')),
+            expires_at TEXT,
+            related_entities TEXT DEFAULT ''
+        );
+
+        -- FTS v2 索引（支持 agent_name 搜索）
+        CREATE VIRTUAL TABLE IF NOT EXISTS short_fts_v2 USING fts5(
+            title, content, segmented, agent_name,
+            tokenize='unicode61'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS long_fts_v2 USING fts5(
+            title, content, segmented, agent_name,
+            tokenize='unicode61'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS memos_fts USING fts5(
+            title, content, segmented, agent_name, tags,
+            tokenize='unicode61'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS activity_fts USING fts5(
+            title, content, agent_name,
+            tokenize='unicode61'
+        );
     """)
+
+    # 为现有表添加 agent_name 字段（兼容性处理）
+    try:
+        conn.execute("ALTER TABLE short_term ADD COLUMN agent_name TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+    try:
+        conn.execute("ALTER TABLE long_term ADD COLUMN agent_name TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
     conn.commit()
     conn.close()
     print(f"✅ Context Hub 初始化完成: {DB_PATH}")
@@ -403,6 +473,102 @@ def entity_graph(entity_name, depth=1):
     return result
 
 # ══════════════════════════════════════════════
+# Agent Activity (Agent 活动流)
+# ══════════════════════════════════════════════
+
+def activity_report(agent_name, activity_type, title, content, session_id=""):
+    """记录 agent 活动到活动流"""
+    conn = get_db()
+    cur = conn.execute(
+        """INSERT INTO agent_activity (agent_name, activity_type, title, content, session_id)
+           VALUES (?, ?, ?, ?, ?) RETURNING id""",
+        (agent_name, activity_type, title, content, session_id)
+    )
+    aid = cur.fetchone()[0]
+    # 更新 FTS
+    seg = segment(f"{title} {content} {agent_name}")
+    conn.execute(
+        "INSERT INTO activity_fts(rowid, title, content, agent_name) VALUES (?, ?, ?, ?)",
+        (aid, title, content[:500], agent_name)
+    )
+    conn.commit()
+    conn.close()
+    return aid
+
+def activity_list(agent_name=None, limit=20):
+    """列出 agent 活动"""
+    conn = get_db()
+    if agent_name:
+        rows = conn.execute(
+            "SELECT * FROM agent_activity WHERE agent_name=? ORDER BY created_at DESC LIMIT ?",
+            (agent_name, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM agent_activity ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    conn.close()
+    return rows
+
+# ══════════════════════════════════════════════
+# Memos (跨 agent 共享笔记)
+# ══════════════════════════════════════════════
+
+def memo_add(agent_name, memo_type, title, content, tags="", importance=0.5, expire_days=None, related_entities=""):
+    """添加跨 agent 共享笔记"""
+    conn = get_db()
+    expires = None
+    if expire_days:
+        expires = (datetime.now() + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        """INSERT INTO memos (agent_name, memo_type, title, content, tags, importance, expires_at, related_entities)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
+        (agent_name, memo_type, title, content, tags, importance, expires, related_entities)
+    )
+    mid = cur.fetchone()[0]
+    # 更新 FTS
+    seg = segment(f"{title} {content} {agent_name} {tags}")
+    conn.execute(
+        "INSERT INTO memos_fts(rowid, title, content, segmented, agent_name, tags) VALUES (?, ?, ?, ?, ?, ?)",
+        (mid, title, content[:500], seg, agent_name, tags)
+    )
+    conn.commit()
+    conn.close()
+    return mid
+
+def memo_list(agent_name=None, memo_type=None, limit=20):
+    """列出共享笔记"""
+    conn = get_db()
+    query = "SELECT * FROM memos WHERE 1=1"
+    params = []
+    if agent_name:
+        query += " AND agent_name=?"
+        params.append(agent_name)
+    if memo_type:
+        query += " AND memo_type=?"
+        params.append(memo_type)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return rows
+
+def memo_get(memo_id):
+    """获取单条 memo"""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM memos WHERE id=?", (memo_id,)).fetchone()
+    conn.close()
+    return row
+
+def memo_delete(memo_id):
+    """删除 memo"""
+    conn = get_db()
+    conn.execute("INSERT INTO memos_fts(memos_fts, rowid) VALUES ('delete', ?)", (memo_id,))
+    conn.execute("DELETE FROM memos WHERE id=?", (memo_id,))
+    conn.commit()
+    conn.close()
+
+# ══════════════════════════════════════════════
 # Consolidation (短期 → 长期 整合)
 # ══════════════════════════════════════════════
 
@@ -487,7 +653,7 @@ def _embed_mem(scope, mem_id, text):
 
 def recall(query, limit=10, mode="hybrid"):
     """
-    统一检索：同时搜索短期和长期记忆
+    统一检索：同时搜索短期记忆、长期记忆、memory_sources、memos 和 agent_activity
     mode: fts / vector / hybrid
     """
     results = []
@@ -511,6 +677,31 @@ def recall(query, limit=10, mode="hybrid"):
             WHERE long_fts MATCH ?
             ORDER BY f.rank LIMIT ?
         """, (seg_query, limit)).fetchall()
+        # Memory Sources FTS
+        memory_rows = conn.execute("""
+            SELECT m.id, m.block_title as title, m.block_content as content,
+                   m.agent_name, m.source_file, m.section_date,
+                   m.created_at, 'memory' as scope, f.rank as score
+            FROM memory_sources_fts f JOIN memory_sources m ON m.id = f.rowid
+            WHERE memory_sources_fts MATCH ?
+            ORDER BY f.rank LIMIT ?
+        """, (seg_query, limit)).fetchall()
+        # Memos FTS
+        memo_rows = conn.execute("""
+            SELECT m.id, m.title, m.content, m.memo_type as mem_type, m.importance,
+                   m.agent_name, m.created_at, 'memo' as scope, f.rank as score
+            FROM memos_fts f JOIN memos m ON m.id = f.rowid
+            WHERE memos_fts MATCH ?
+            ORDER BY f.rank LIMIT ?
+        """, (seg_query, limit)).fetchall()
+        # Agent Activity FTS
+        activity_rows = conn.execute("""
+            SELECT a.id, a.title, a.content, a.activity_type as mem_type,
+                   a.agent_name, a.created_at, 'activity' as scope, f.rank as score
+            FROM activity_fts f JOIN agent_activity a ON a.id = f.rowid
+            WHERE activity_fts MATCH ?
+            ORDER BY f.rank LIMIT ?
+        """, (seg_query, limit)).fetchall()
         conn.close()
 
         for r in short_rows:
@@ -523,6 +714,22 @@ def recall(query, limit=10, mode="hybrid"):
                           "id": r["id"], "title": r["title"], "content": r["content"][:150],
                           "type": r["mem_type"], "importance": r["importance"],
                           "time": r["created_at"]})
+        for r in memory_rows:
+            results.append({"scope": "memory", "source": "fts", "score": r["score"],
+                          "id": r["id"], "title": r["title"], "content": r["content"][:150],
+                          "type": "memory", "importance": 1.0,
+                          "agent": r["agent_name"], "source_file": r["source_file"],
+                          "time": r["created_at"]})
+        for r in memo_rows:
+            results.append({"scope": "memo", "source": "fts", "score": r["score"],
+                          "id": r["id"], "title": r["title"], "content": r["content"][:150],
+                          "type": r["mem_type"], "importance": r["importance"],
+                          "agent": r["agent_name"], "time": r["created_at"]})
+        for r in activity_rows:
+            results.append({"scope": "activity", "source": "fts", "score": r["score"],
+                          "id": r["id"], "title": r["title"], "content": r["content"][:150],
+                          "type": r["mem_type"], "importance": 0.5,
+                          "agent": r["agent_name"], "time": r["created_at"]})
 
     if mode in ("vector", "hybrid"):
         try:
@@ -548,26 +755,46 @@ def recall(query, limit=10, mode="hybrid"):
                 if any(r["scope"] == scope and r["id"] == mem_id for r in results):
                     continue
 
-                table = "short_term" if scope == "short" else "long_term"
-                time_col = "created_at" if scope == "short" else "updated_at"
                 conn = get_db()
-                row = conn.execute(
-                    f"SELECT id, title, content, mem_type, importance, {time_col} as time FROM {table} WHERE id=?",
-                    (mem_id,)
-                ).fetchone()
+                if scope == "short":
+                    row = conn.execute(
+                        "SELECT id, title, content, mem_type, importance, created_at as time FROM short_term WHERE id=?",
+                        (mem_id,)
+                    ).fetchone()
+                elif scope == "long":
+                    row = conn.execute(
+                        "SELECT id, title, content, mem_type, importance, updated_at as time FROM long_term WHERE id=?",
+                        (mem_id,)
+                    ).fetchone()
+                elif scope == "memory":
+                    row = conn.execute(
+                        "SELECT id, block_title as title, block_content as content, agent_name, source_file, created_at as time FROM memory_sources WHERE id=?",
+                        (mem_id,)
+                    ).fetchone()
+                else:
+                    row = None
                 conn.close()
 
                 if row:
-                    results.append({"scope": scope, "source": "vector", "score": sim,
-                                  "id": row["id"], "title": row["title"],
-                                  "content": row["content"][:150],
-                                  "type": row["mem_type"],
-                                  "importance": row["importance"],
-                                  "time": row["time"]})
+                    if scope == "memory":
+                        results.append({"scope": scope, "source": "vector", "score": sim,
+                                      "id": row["id"], "title": row["title"],
+                                      "content": row["content"][:150],
+                                      "type": "memory", "importance": 1.0,
+                                      "agent": row["agent_name"], "source_file": row["source_file"],
+                                      "time": row["time"]})
+                    else:
+                        results.append({"scope": scope, "source": "vector", "score": sim,
+                                      "id": row["id"], "title": row["title"],
+                                      "content": row["content"][:150],
+                                      "type": row["mem_type"],
+                                      "importance": row["importance"],
+                                      "time": row["time"]})
 
-    # 排序：长期记忆优先（权重更高），短期记忆次之
+    # 排序：长期记忆优先，memory 次之，memo 再次，短期记忆再次，activity 最后
     def sort_key(r):
-        boost = 1.2 if r["scope"] == "long" else 1.0
+        scope_boost = {"long": 1.2, "memory": 1.1, "memo": 1.05, "short": 1.0, "activity": 0.9}
+        boost = scope_boost.get(r["scope"], 1.0)
         return r["score"] * boost
     results.sort(key=sort_key, reverse=True)
 
@@ -584,13 +811,34 @@ def status():
     ent = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
     rel = conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
     emb = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+    memos_count = conn.execute("SELECT COUNT(*) FROM memos").fetchone()[0]
+    activity_count = conn.execute("SELECT COUNT(*) FROM agent_activity").fetchone()[0]
+    memory_count = conn.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0] if _table_exists(conn, "memory_sources") else 0
 
     st_types = conn.execute("SELECT mem_type, COUNT(*) c FROM short_term GROUP BY mem_type").fetchall()
     lt_types = conn.execute("SELECT mem_type, COUNT(*) c FROM long_term GROUP BY mem_type").fetchall()
     ent_types = conn.execute("SELECT entity_type, COUNT(*) c FROM entities GROUP BY entity_type").fetchall()
 
+    # Agent 统计
+    agent_activity_stats = conn.execute(
+        "SELECT agent_name, COUNT(*) c FROM agent_activity GROUP BY agent_name ORDER BY c DESC"
+    ).fetchall()
+    agent_memo_stats = conn.execute(
+        "SELECT agent_name, COUNT(*) c FROM memos GROUP BY agent_name ORDER BY c DESC"
+    ).fetchall()
+    agent_memory_stats = conn.execute(
+        "SELECT agent_name, COUNT(*) c FROM memory_sources GROUP BY agent_name ORDER BY c DESC"
+    ).fetchall() if _table_exists(conn, "memory_sources") else []
+
     recent_short = conn.execute("SELECT title, created_at FROM short_term ORDER BY created_at DESC LIMIT 3").fetchall()
     recent_long = conn.execute("SELECT title, updated_at FROM long_term ORDER BY updated_at DESC LIMIT 3").fetchall()
+    recent_memos = conn.execute("SELECT title, agent_name, created_at FROM memos ORDER BY created_at DESC LIMIT 3").fetchall()
+    recent_activity = conn.execute(
+        "SELECT title, agent_name, activity_type, created_at FROM agent_activity ORDER BY created_at DESC LIMIT 5"
+    ).fetchall()
+    recent_memory = conn.execute(
+        "SELECT block_title, agent_name, source_file, created_at FROM memory_sources ORDER BY created_at DESC LIMIT 5"
+    ).fetchall() if _table_exists(conn, "memory_sources") else []
 
     expired = forget_expired()
     decayed = decay_importance()
@@ -599,16 +847,33 @@ def status():
 
     return {
         "short_term": st, "long_term": lt,
+        "memory_sources": memory_count,
         "entities": ent, "relations": rel,
         "embeddings": emb,
+        "memos": memos_count,
+        "activity": activity_count,
         "expired_cleaned": expired,
         "confidence_decayed": decayed,
         "short_types": dict(st_types),
         "long_types": dict(lt_types),
         "entity_types": dict(ent_types),
+        "agent_activity_stats": dict(agent_activity_stats),
+        "agent_memo_stats": dict(agent_memo_stats),
+        "agent_memory_stats": dict(agent_memory_stats),
         "recent_short": recent_short,
         "recent_long": recent_long,
+        "recent_memos": recent_memos,
+        "recent_activity": recent_activity,
+        "recent_memory": recent_memory,
     }
+
+def _table_exists(conn, table_name):
+    """检查表是否存在"""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,)
+    ).fetchone()
+    return row is not None
 
 # ══════════════════════════════════════════════
 # CLI
@@ -636,6 +901,19 @@ Context Hub - 统一记忆系统
   hub.py long-get <id>
   hub.py long-del <id>
   hub.py long-update <id> [--content ...] [--importance 0.9] [--confidence 0.8]
+
+  Agent 活动:
+  hub.py activity-report <agent> <type> <title> <content> [--session-id xxx]
+      type: task_completed|decision_made|info_reported|error_occurred|heartbeat_report
+  hub.py activity-list [--agent xxx]
+
+  跨 Agent 共享笔记:
+  hub.py memo-add <type> <title> <content> [options]
+      --agent xxx  --tags tag1,tag2  --importance 0.8  --expire 7
+      type: fact|insight|question|answer|cross_reference
+  hub.py memo-list [--agent xxx] [--type ...]
+  hub.py memo-get <id>
+  hub.py memo-del <id>
 
   实体 & 关系:
   hub.py entity-add <name> <type> [aliases] [description]
@@ -693,13 +971,21 @@ def main():
         s = status()
         print("═══ Context Hub 状态 ═══")
         print(f"\n  🧠 短期记忆: {s['short_term']}  |  💎 长期记忆: {s['long_term']}")
+        print(f"  📚 Memory Sources: {s['memory_sources']}")
         print(f"  👤 实体: {s['entities']}  |  🔗 关系: {s['relations']}  |  📐 向量: {s['embeddings']}")
+        print(f"  📝 Memos: {s['memos']}  |  📊 Agent 活动: {s['activity']}")
         if s["short_types"]:
             print(f"\n  短期记忆类型: {json.dumps(s['short_types'], ensure_ascii=False)}")
         if s["long_types"]:
             print(f"  长期记忆类型: {json.dumps(s['long_types'], ensure_ascii=False)}")
         if s["entity_types"]:
             print(f"  实体类型: {json.dumps(s['entity_types'], ensure_ascii=False)}")
+        if s["agent_activity_stats"]:
+            print(f"\n  🤖 Agent 活动统计: {json.dumps(s['agent_activity_stats'], ensure_ascii=False)}")
+        if s["agent_memo_stats"]:
+            print(f"  📝 Agent Memo 统计: {json.dumps(s['agent_memo_stats'], ensure_ascii=False)}")
+        if s["agent_memory_stats"]:
+            print(f"  📚 Agent Memory 统计: {json.dumps(s['agent_memory_stats'], ensure_ascii=False)}")
         if s["recent_short"]:
             print(f"\n  📥 最近短期记忆:")
             for r in s["recent_short"]:
@@ -708,6 +994,18 @@ def main():
             print(f"\n  💎 最近长期记忆:")
             for r in s["recent_long"]:
                 print(f"     {r[1]} | {r[0]}")
+        if s["recent_memory"]:
+            print(f"\n  📚 最近 Memory Sources:")
+            for r in s["recent_memory"]:
+                print(f"     [{r[1]}] {r[3]} | {r[0]} (from {r[2]})")
+        if s["recent_memos"]:
+            print(f"\n  📝 最近 Memos:")
+            for r in s["recent_memos"]:
+                print(f"     [{r[1]}] {r[2]} | {r[0]}")
+        if s["recent_activity"]:
+            print(f"\n  📊 最近活动:")
+            for r in s["recent_activity"]:
+                print(f"     [{r[1]}] {r[3]} | {r[2]}: {r[0]}")
         print(f"\n  🧹 本次清理过期: {s['expired_cleaned']}  |  📉 权重衰减: {s['confidence_decayed']}")
 
     elif cmd == "short-add":
@@ -814,6 +1112,86 @@ def main():
         )
         print(f"✅ 长期记忆 #{args[1]} 已更新")
 
+    # Agent Activity commands
+    elif cmd == "activity-report":
+        if len(args) < 5:
+            print("❌ 用法: hub.py activity-report <agent> <type> <title> <content>")
+            return
+        init_db()
+        opts, consumed = _parse_opts(args[4:])
+        content_parts = _positional_args(args[4:], consumed)
+        aid = activity_report(
+            args[1], args[2], args[3], " ".join(content_parts),
+            session_id=opts.get("session-id", "")
+        )
+        print(f"✅ 活动记录 #{aid} 已添加")
+
+    elif cmd == "activity-list":
+        init_db()
+        agent_name = None
+        if "--agent" in args:
+            idx = args.index("--agent")
+            agent_name = args[idx+1] if idx+1 < len(args) else None
+        rows = activity_list(agent_name)
+        if not rows:
+            print("📭 空空如也")
+            return
+        print(f"📊 Agent 活动 ({len(rows)} 条)\n")
+        for r in rows:
+            print(f"  #{r['id']} [{r['agent_name']}] [{r['activity_type']}] {r['title']}")
+            print(f"     {r['content'][:80]}{'...' if len(r['content'])>80 else ''}")
+            print(f"     🕐 {r['created_at']}")
+
+    # Memo commands
+    elif cmd == "memo-add":
+        if len(args) < 4:
+            print("❌ 用法: hub.py memo-add <type> <title> <content>")
+            return
+        init_db()
+        opts, consumed = _parse_opts(args[3:])
+        content_parts = _positional_args(args[3:], consumed)
+        mid = memo_add(
+            opts.get("agent", "unknown"), args[1], args[2], " ".join(content_parts),
+            tags=opts.get("tags", ""),
+            importance=float(opts.get("importance", 0.5)),
+            expire_days=int(opts["expire"]) if "expire" in opts else None,
+            related_entities=opts.get("related", "")
+        )
+        print(f"✅ Memo #{mid} 已添加")
+
+    elif cmd == "memo-list":
+        init_db()
+        agent_name = None
+        memo_type = None
+        if "--agent" in args:
+            idx = args.index("--agent")
+            agent_name = args[idx+1] if idx+1 < len(args) else None
+        if "--type" in args:
+            idx = args.index("--type")
+            memo_type = args[idx+1] if idx+1 < len(args) else None
+        rows = memo_list(agent_name, memo_type)
+        if not rows:
+            print("📭 空空如也")
+            return
+        print(f"📝 Memos ({len(rows)} 条)\n")
+        for r in rows:
+            print(f"  #{r['id']} [{r['agent_name']}] [{r['memo_type']}] ⭐{r['importance']:.1f} {r['title']}")
+            print(f"     {r['content'][:80]}{'...' if len(r['content'])>80 else ''}")
+            print(f"     🏷️ {r['tags']}  🕐 {r['created_at']}")
+
+    elif cmd == "memo-get":
+        if len(args) < 2: return
+        init_db()
+        r = memo_get(int(args[1]))
+        if r: print(json.dumps(dict(r), ensure_ascii=False, indent=2))
+        else: print("❌ 未找到")
+
+    elif cmd == "memo-del":
+        if len(args) < 2: return
+        init_db()
+        memo_delete(int(args[1]))
+        print(f"🗑️ Memo #{args[1]} 已删除")
+
     elif cmd == "entity-add":
         if len(args) < 3: return
         init_db()
@@ -897,12 +1275,13 @@ def main():
             print("🔍 无结果")
             return
         print(f"🔍 检索结果 ({len(results)} 条):\n")
-        scope_icon = {"short": "🧠", "long": "💎"}
+        scope_icon = {"short": "🧠", "long": "💎", "memo": "📝", "activity": "📊"}
         source_label = {"fts": "关键词", "vector": "语义"}
         for r in results:
             icon = scope_icon.get(r["scope"], "?")
             label = source_label.get(r["source"], "?")
-            print(f"  {icon} #{r['id']} [{r['type']}] {r['title']}")
+            agent_info = f" [{r.get('agent', '')}]" if r.get("agent") else ""
+            print(f"  {icon} #{r['id']}{agent_info} [{r['type']}] {r['title']}")
             print(f"     📊 {label} {r['score']:.4f}  ⭐{r['importance']:.1f}")
             print(f"     💬 {r['content']}")
             print(f"     🕐 {r['time']}")

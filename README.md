@@ -171,6 +171,84 @@ hub.py status                                  查看状态
 3. **渐进增强** — 短期记忆自动沉淀为长期记忆，越用越智能
 4. **人类可读** — 所有数据都可以直接用 SQL 查询和调试
 
+## OpenClaw 集成
+
+Context Hub 作为 OpenClaw 多 agent 共享记忆系统，为所有 agent 提供统一的记忆存储和检索能力。
+
+### 安装
+
+```bash
+cd /path/to/context-hub
+chmod +x setup.sh
+./setup.sh
+```
+
+详细安装说明请参考 [README_SETUP.md](README_SETUP.md)。
+
+### MCP 工具列表
+
+Context Hub 通过 MCP 协议提供以下工具：
+
+| 工具 | 功能 |
+|------|------|
+| `ctx_recall` | 统一检索（关键词/语义/混合） |
+| `ctx_short_add` | 添加短期记忆（事件/对话/待办/决策） |
+| `ctx_long_add` | 添加长期记忆（人物/项目/知识/偏好） |
+| `ctx_memo_add` | 添加跨 agent 共享笔记 |
+| `ctx_activity_report` | 上报 agent 活动（任务完成/决策/错误） |
+| `ctx_entity_add` | 添加实体（人物/项目/工具/组织） |
+| `ctx_rel_add` | 添加实体关系 |
+| `ctx_graph` | 查询实体关系图 |
+| `ctx_status` | 查看系统状态 |
+| `ctx_forget` | 执行遗忘清理 |
+| `ctx_consolidate` | 查看短期→长期整合候选 |
+
+### 自动摄入
+
+系统会自动从各 agent 的 memory 文件中提取信息：
+
+- **时间**：每天凌晨 2:00
+- **来源**：`~/.openclaw/agents/*/workspace/MEMORY.md` 和 `memory/*.md`
+- **提取内容**：事实、事件、人物、项目、工具
+
+### 使用示例
+
+在 agent 中调用 MCP 工具：
+
+```python
+# 添加长期记忆
+ctx_long_add(
+    mem_type="person",
+    title="张三",
+    content="后端工程师，负责 API 开发",
+    importance=0.8
+)
+
+# 检索
+ctx_recall(query="后端开发", mode="hybrid", limit=10)
+
+# 上报活动
+ctx_activity_report(
+    agent_name="my-agent",
+    activity_type="task_completed",
+    title="完成 API 重构",
+    content="重构了用户认证 API，提升了 30% 性能"
+)
+```
+
+### Heartbeat 上报
+
+在 agent 的 heartbeat 中，可以使用 Context Hub 共享信息：
+
+```markdown
+# Context Hub Heartbeat 上报
+
+如果有值得共享的信息，通过 MCP 工具上报：
+- ctx_activity_report: 关键决策、任务完成、重要发现
+- ctx_memo_add: 跨 agent 共享的笔记和洞察
+- ctx_entity_add: 新发现的人物、项目、工具、组织
+```
+
 ## License
 
 MIT
