@@ -1,28 +1,49 @@
 # Context Hub
 
-> 统一记忆系统 —— 模拟人类记忆模型的知识管理方案
+> 多 Agent 共享工作记忆 —— 让 AI Agent 之间真正互通信息
 
-Context Hub 是一个基于 SQLite + 向量检索的本地记忆系统，模拟人类的**短期记忆**和**长期记忆**模型，为 AI Agent 提供完整的 context 管理。
+Context Hub 是为 [OpenClaw](https://github.com/openclaw/openclaw) 设计的**多 Agent 共享记忆基础设施**。它为所有 Agent 提供统一的记忆存储、知识图谱和跨 Agent 信息检索能力——就像一个公司里的**公共黑板**。
 
 ## 为什么需要 Context Hub？
 
-AI Agent 在日常使用中会产生大量分散的 context：对话记录、决策、人物关系、工具偏好、知识积累……这些信息散落在各平台，缺乏统一管理和智能检索能力。
+OpenClaw 中每个 Agent 有自己的 memory 文件（`MEMORY.md`、`memory/*.md`），但这些信息是**孤岛**——Agent A 不知道 Agent B 今天做了什么决策、发现了什么、认识了谁。
 
-Context Hub 的核心思路：
+Context Hub 解决的就是这个**跨 Agent 信息互通**问题：
 
 ```
-原始信息 → 采集 → 短期记忆 → 提炼 → 长期记忆 → 统一检索
-              ↑                              ↓
-              └──────── 遗忘机制 ←────────────┘
+Agent A ──上报──→ ┌──────────────┐ ←──检索── Agent B
+Agent C ──上报──→ │ Context Hub  │ ←──检索── Agent D
+                  │  共享工作记忆  │
+Memory 文件 ─摄入→ │  实体 & 关系  │
+                  │  知识图谱     │
+                  └──────────────┘
+                       ↑
+                  每天自动扫描摄入
 ```
 
-## 记忆模型
+### 与 OpenClaw 原生机制的关系
 
-| 层级 | 类比 | 内容 | 生命周期 |
-|------|------|------|---------|
-| **感觉记忆** | 刚听到的话 | 当前对话上下文 | 分钟级 |
-| **短期记忆** | 今天在忙什么 | 事件、对话摘要、待办、决策 | 天/周级（自动过期） |
-| **长期记忆** | 我知道的事 | 人物、项目、经验、偏好、知识 | 永久（权重衰减） |
+| 机制 | 定位 | 生命周期 | 可见性 |
+|------|------|---------|--------|
+| session 对话上下文 | 感觉记忆 | 单次会话 | 当前 session |
+| Agent memory 文件 | 私人笔记 | 持久化 | 单个 Agent |
+| MEMORY.md | 个人长期记忆 | 持久化 | 单个 Agent |
+| **Context Hub** | **共享工作记忆** | **持久化** | **所有 Agent** |
+
+类比：memory 文件是每个人的**笔记本**，Context Hub 是公司的**共享 Wiki + 通讯录 + 项目看板**。
+
+## 数据模型
+
+Context Hub 管理五类数据，支持**五维统一检索**：
+
+| 数据 | 说明 | 生命周期 |
+|------|------|---------|
+| **短期记忆** (short_term) | 事件、决策、待办、对话摘要 | 天/周级，自动过期 |
+| **长期记忆** (long_term) | 人物、项目、知识、经验、偏好 | 永久，权重衰减 |
+| **Memory Sources** | Agent memory 文件的直接索引 | 跟随文件更新 |
+| **共享笔记** (memos) | 跨 Agent 共享的洞察、事实、问题 | 可设过期 |
+| **实体 & 关系** | 人物、项目、工具、组织的知识图谱 | 永久 |
+| **活动流** (agent_activity) | Agent 上报的任务完成、决策、发现 | 永久 |
 
 ## 功能
 
@@ -150,9 +171,21 @@ hub.py status                                  查看状态
   hub.py long-del <id>                         删除
   hub.py long-update <id> [--content ...]      更新
 
+共享笔记:
+  hub.py memo-add <type> <title> <content> [options]
+      --agent xxx  --tags tag1,tag2  --importance 0.8  --expire 7
+  hub.py memo-list [--agent xxx] [--type ...]  列出笔记
+  hub.py memo-get <id>                         查看详情
+  hub.py memo-del <id>                         删除
+
+活动流:
+  hub.py activity-report <agent> <type> <title> <content> [--session-id xxx]
+  hub.py activity-list [--agent xxx]            列出活动
+
 实体 & 关系:
   hub.py entity-add <name> <type> [aliases] [description]
   hub.py entity-find <name>                    查找实体
+  hub.py entity-list [--type ...]              列出实体
   hub.py rel-add <from> <to> <type> [description]
   hub.py graph <entity_name>                   查看关系图
 
@@ -162,14 +195,21 @@ hub.py status                                  查看状态
 维护:
   hub.py consolidate                           查看整合候选
   hub.py forget                                清理过期 + 衰减权重
+
+自动摄入:
+  ingest.py                                    扫描所有 agent memory 并建索引
+      --agent xxx                              只处理指定 agent
+      --dry-run                                预览模式
+      --force                                  强制重新索引
 ```
 
 ## 设计理念
 
 1. **本地优先** — 数据存在本地 SQLite，不上云，不泄露
-2. **零服务依赖** — 除 Ollama 外无需任何外部服务
-3. **渐进增强** — 短期记忆自动沉淀为长期记忆，越用越智能
+2. **零 LLM 依赖摄入** — memory 文件直接索引，不经过 LLM，零信息损耗、秒级完成
+3. **渐进增强** — Agent 主动上报 + 自动摄入，越用越丰富
 4. **人类可读** — 所有数据都可以直接用 SQL 查询和调试
+5. **MCP 原生** — 通过 MCP 协议集成，Agent 像调用工具一样使用
 
 ## OpenClaw 集成
 
@@ -205,11 +245,11 @@ Context Hub 通过 MCP 协议提供以下工具：
 
 ### 自动摄入
 
-系统会自动从各 agent 的 memory 文件中提取信息：
+系统每天自动扫描各 Agent 的 memory 文件，按 section 切分后直接建立 FTS + 向量索引（不经过 LLM，零信息损耗）：
 
-- **时间**：每天凌晨 2:00
-- **来源**：`~/.openclaw/agents/*/workspace/MEMORY.md` 和 `memory/*.md`
-- **提取内容**：事实、事件、人物、项目、工具
+- **时间**：每天凌晨 2:00（OpenClaw cron）
+- **来源**：`~/.openclaw/workspace-{agent-name}/MEMORY.md` 和 `memory/*.md`
+- **处理方式**：按 markdown 标题切分 → jieba 分词 + bge-m3 embedding → 直接索引
 
 ### 使用示例
 
